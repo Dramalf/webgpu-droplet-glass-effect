@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0, minimum-scale=1.0">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Droplet Glass</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 10px;
+            font-family: Arial, sans-serif;
+            background-color: #1a1a1a;
+            color: white;
+            overflow-x: hidden;
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            -khtml-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+        }
+        
+        #canvas {
+            border: 1px solid #333;
+            cursor: crosshair;
+            display: block;
+            margin: 10px auto;
+            background-color: #000;
+            touch-action: none;
+            max-width: 100%;
+            /* max-height: calc(100vh - 120px); */
+        }
+        
+        /* 移动端样式优化 */
+        @media (max-width: 768px) {
+            body {
+                padding: 5px;
+            }
+            
+            #canvas {
+                width: calc(100vw - 20px);
+                height: calc(100vh - 100px);
+                margin: 5px auto;
+                border: none;
+            }
+            
+            .controls {
+                margin: 10px !important;
+            }
+            
+            #fileInput {
+                width: 100%;
+                box-sizing: border-box;
+            }
+        }
+        
+        #fileInput {
+            margin: 20px;
+            padding: 10px;
+            border-radius: 5px;
+            border: none;
+            background-color: #333;
+            color: white;
+        }
+        
+        #info {
+            text-align: center;
+            margin: 20px;
+            font-size: 14px;
+            color: #aaa;
+        }
+        
+        .controls {
+            text-align: center;
+            margin: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <input type="file" id="fileInput" accept="image/*" />
+    </div>
+    
+    <canvas id="canvas" width="800" height="600"></canvas>
+    
+    <!-- <div id="info">
+        Mouse Position: (<span id="mouseX">0</span>, <span id="mouseY">0</span>)<br>
+        Physics Position: (<span id="physicsX">0.5</span>, <span id="physicsY">0.5</span>)<br>
+        Mouse Velocity: (<span id="mouseVelX">0</span>, <span id="mouseVelY">0</span>)<br>
+        Mouse Acceleration: (<span id="mouseAccelX">0</span>, <span id="mouseAccelY">0</span>)<br>
+        Physics Velocity: (<span id="velocityX">0</span>, <span id="velocityY">0</span>)<br>
+        Deformation: Strength <span id="deformStrength">0.0</span>, Angle <span id="deformAngle">0.0</span>°
+    </div> -->
+
+    <script>
+        class WebGPUImageRenderer {
+            constructor() {
+                this.canvas = document.getElementById('canvas');
+                this.mouseX = 0.0;
+                this.mouseY = 0.0;
+                this.isDragging = false;
+                this.device = null;
+                this.context = null;
+                this.renderPipeline = null;
+                this.uniformBuffer = null;
+                this.bindGroup = null;
+                this.texture = null;
+                this.sampler = null;
+                
+                // 物理仿真参数
+                this.physics = {
+                    // 目标位置（鼠标位置）
+                    targetX: 0.5,
+                    targetY: 0.5,
+                    
+                    // 当前物理位置
+                    currentX: 0.5,
+                    currentY: 0.5,
+                    
+                    // 速度
+                    velocityX: 0.0,
+                    velocityY: 0.0,
+                    
+                    // 上一帧位置（用于计算速度）
+                    prevX: 0.5,
+                    prevY: 0.5,
+                    
+                    // 物理常数
+                    springStrength: 1.0,    // 弹簧强度
+                    damping: 0.85,           // 阻尼系数
+                    maxVelocity: 10.0,        // 最大速度限制
+                    
+                    // 形变参数
+                    deformationStrength: 0.0,  // 形变强度 (0-1)
+                    deformationAngle: 0.0,     // 形变角度 (弧度)
+                    maxDeformation: 2.0,       // 最大形变程度
+                    deformationDecay: 0.4      // 形变恢复速度
+                };
+                
+                // 鼠标跟踪参数
+                this.mouse = {
+                    // 当前鼠标位置
+                    currentX: 0.5,
+                    currentY: 0.5,
+                    
+                    // 上一帧鼠标位置
+                    prevX: 0.5,
+                    prevY: 0.5,
+                    
+                    // 鼠标速度
+                    velocityX: 0.0,
+                    velocityY: 0.0,
+                    
+                    // 上一帧鼠标速度
+                    prevVelocityX: 0.0,
+                    prevVelocityY: 0.0,
+                    
+                    // 鼠标加速度
+                    accelerationX: 0.0,
+                    accelerationY: 0.0,
+                    
+                    // 加速度平滑因子
+                    accelerationSmoothing: 0.8
+                };
+                
+                this.setupMouseEvents();
+                this.setupCanvas();
+            }
+
+            setupCanvas() {
+                // 不需要特殊的画布设置，使用默认尺寸
+            }
+
+            async init() {
+                if (!navigator.gpu) {
+                    throw new Error('WebGPU not supported');
+                }
+
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) {
+                    throw new Error('No appropriate GPUAdapter found');
+                }
+
+                this.device = await adapter.requestDevice();
+                this.context = this.canvas.getContext('webgpu');
+
+                const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+                this.context.configure({
+                    device: this.device,
+                    format: canvasFormat,
+                });
+
+                await this.createShaders();
+                this.createBuffers();
+                
+                // 尝试加载默认图片，如果失败则使用默认纹理
+                await this.loadDefaultImage();
+
+                this.render();
+            }
+
+            async loadShaderFile(url) {
+                try {
+                    const response = await fetch(url);
+                    if (!response.ok) {
+                        throw new Error(`Failed to load shader file: ${response.statusText}`);
+                    }
+                    return await response.text();
+                } catch (error) {
+                    console.error('Error loading shader file:', error);
+                    throw error;
+                }
+            }
+
+            async createShaders() {
+                // 加载WGSL shader文件
+                const shaderCode = await this.loadShaderFile('./shader.wgsl');
+
+                const shaderModule = this.device.createShaderModule({
+                    code: shaderCode,
+                });
+
+                this.renderPipeline = this.device.createRenderPipeline({
+                    layout: 'auto',
+                    vertex: {
+                        module: shaderModule,
+                        entryPoint: 'vs_main',
+                    },
+                    fragment: {
+                        module: shaderModule,
+                        entryPoint: 'fs_main',
+                        targets: [{
+                            format: navigator.gpu.getPreferredCanvasFormat(),
+                        }],
+                    },
+                    primitive: {
+                        topology: 'triangle-list',
+                    },
+                });
+            }
+
+            createBuffers() {
+                // Uniform buffer: mousePos (8) + time (4) + padding (4) + resolution (8) + deformation (8) = 32 bytes
+                this.uniformBuffer = this.device.createBuffer({
+                    size: 48, 
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+                });
+            }
+
+            async loadDefaultImage() {
+                try {
+                    // 检测是否为移动端
+                    const isMobile = /Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || 
+                                   (navigator.maxTouchPoints > 0 && window.innerWidth <= 768);
+                    
+                    // 根据设备类型选择默认图片
+                    const defaultImage = isMobile ? './demo1.jpg' : './demo3.jpg';
+                    
+                    // 尝试加载默认图片
+                    const response = await fetch(defaultImage);
+                    if (response.ok) {
+                        const blob = await response.blob();
+                        await this.updateTextureFromBlob(blob);
+                        console.log(`Default image loaded successfully: ${defaultImage}`);
+                        return;
+                    }
+                    
+                    // 如果主要图片加载失败，尝试加载备用图片
+                    const fallbackImage = isMobile ? './demo3.jpg' : './demo2.jpg';
+                    const fallbackResponse = await fetch(fallbackImage);
+                    if (fallbackResponse.ok) {
+                        const blob = await fallbackResponse.blob();
+                        await this.updateTextureFromBlob(blob);
+                        console.log(`Fallback image loaded successfully: ${fallbackImage}`);
+                        return;
+                    }
+                } catch (error) {
+                    console.log('Default image not found, using fallback texture');
+                }
+                
+                // 如果所有图片都加载失败，使用默认纹理
+                this.createDefaultTexture();
+            }
+
+            async updateTextureFromBlob(blob) {
+                const img = await this.loadImageFromBlob(blob);
+                
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                this.canvas.width = img.width/2;
+                this.canvas.height = img.height/2;
+                console.log(img.width/2, img.height/2);
+                ctx.drawImage(img, 0, 0);
+                const imageData = ctx.getImageData(0, 0, img.width, img.height);
+                
+                this.texture = this.device.createTexture({
+                    size: [img.width, img.height, 1],
+                    format: 'rgba8unorm',
+                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+                });
+
+                this.device.queue.writeTexture(
+                    { texture: this.texture },
+                    imageData.data,
+                    { bytesPerRow: img.width * 4 },
+                    { width: img.width, height: img.height }
+                );
+
+                this.sampler = this.device.createSampler({
+                    magFilter: 'linear',
+                    minFilter: 'linear',
+                });
+
+                this.createBindGroup();
+            }
+
+            loadImageFromBlob(blob) {
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => resolve(img);
+                    img.onerror = reject;
+                    img.src = URL.createObjectURL(blob);
+                });
+            }
+
+            createDefaultTexture() {
+                const size = 256;
+                const data = new Uint8Array(size * size * 4);
+                
+                for (let y = 0; y < size; y++) {
+                    for (let x = 0; x < size; x++) {
+                        const index = (y * size + x) * 4;
+                        data[index] = (x / size) * 255;
+                        data[index + 1] = (y / size) * 255;
+                        data[index + 2] = 128;
+                        data[index + 3] = 255;
+                    }
+                }
+
+                this.texture = this.device.createTexture({
+                    size: [size, size, 1],
+                    format: 'rgba8unorm',
+                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+                });
+
+                this.device.queue.writeTexture(
+                    { texture: this.texture },
+                    data,
+                    { bytesPerRow: size * 4 },
+                    { width: size, height: size }
+                );
+
+                this.sampler = this.device.createSampler({
+                    magFilter: 'linear',
+                    minFilter: 'linear',
+                });
+
+                this.createBindGroup();
+            }
+
+            createBindGroup() {
+                this.bindGroup = this.device.createBindGroup({
+                    layout: this.renderPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: this.uniformBuffer } },
+                        { binding: 1, resource: this.sampler },
+                        { binding: 2, resource: this.texture.createView() },
+                    ],
+                });
+            }
+
+
+
+            async updateTexture(imageFile) {
+                try {
+                    await this.updateTextureFromBlob(imageFile);
+                } catch (error) {
+                    console.error('Error loading image:', error);
+                }
+            }
+
+            setupMouseEvents() {
+                // 桌面端鼠标事件
+                this.canvas.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    this.isDragging = true;
+                    this.updatePointerPosition(e);
+                });
+
+                this.canvas.addEventListener('mousemove', (e) => {
+                    e.preventDefault();
+                    if (this.isDragging) {
+                        this.updatePointerPosition(e);
+                    }
+                });
+
+                this.canvas.addEventListener('mouseup', (e) => {
+                    e.preventDefault();
+                    this.isDragging = false;
+                });
+
+                this.canvas.addEventListener('mouseleave', (e) => {
+                    e.preventDefault();
+                    this.isDragging = false;
+                });
+
+                // 移动端触摸事件
+                this.canvas.addEventListener('touchstart', (e) => {
+                    e.preventDefault();
+                    this.isDragging = true;
+                    if (e.touches.length > 0) {
+                        this.updatePointerPosition(e.touches[0]);
+                    }
+                }, { passive: false });
+
+                this.canvas.addEventListener('touchmove', (e) => {
+                    e.preventDefault();
+                    if (this.isDragging && e.touches.length > 0) {
+                        this.updatePointerPosition(e.touches[0]);
+                    }
+                }, { passive: false });
+
+                this.canvas.addEventListener('touchend', (e) => {
+                    e.preventDefault();
+                    this.isDragging = false;
+                }, { passive: false });
+
+                this.canvas.addEventListener('touchcancel', (e) => {
+                    e.preventDefault();
+                    this.isDragging = false;
+                }, { passive: false });
+
+                // 禁用画布上的默认触摸行为（如滚动、缩放）
+                this.canvas.style.touchAction = 'none';
+            }
+
+            updatePointerPosition(event) {
+                const rect = this.canvas.getBoundingClientRect();
+                this.mouseX = (event.clientX - rect.left) / rect.width;
+                this.mouseY = (event.clientY - rect.top) / rect.height;
+
+                // 确保坐标在有效范围内
+                this.mouseX = Math.max(0, Math.min(1, this.mouseX));
+                this.mouseY = Math.max(0, Math.min(1, this.mouseY));
+
+                // 更新物理目标位置
+                this.physics.targetX = this.mouseX;
+                this.physics.targetY = this.mouseY;
+                
+                // 更新鼠标跟踪数据
+                this.updateMouseTracking();
+
+                // this.updateDebugInfo();
+            }
+            
+            updateMouseTracking() {
+                const m = this.mouse;
+                
+                // 保存上一帧数据
+                m.prevX = m.currentX;
+                m.prevY = m.currentY;
+                m.prevVelocityX = m.velocityX;
+                m.prevVelocityY = m.velocityY;
+                
+                // 更新当前位置
+                m.currentX = this.mouseX;
+                m.currentY = this.mouseY;
+                
+                // 计算瞬时速度（位置差）
+                m.velocityX = m.currentX - m.prevX;
+                m.velocityY = m.currentY - m.prevY;
+                
+                // 计算加速度（速度差）
+                const rawAccelX = m.velocityX - m.prevVelocityX;
+                const rawAccelY = m.velocityY - m.prevVelocityY;
+                
+                // 平滑加速度
+                m.accelerationX = m.accelerationX * m.accelerationSmoothing + rawAccelX * (1.0 - m.accelerationSmoothing);
+                m.accelerationY = m.accelerationY * m.accelerationSmoothing + rawAccelY * (1.0 - m.accelerationSmoothing);
+            }
+
+            updatePhysics(deltaTime) {
+                const p = this.physics;
+                const m = this.mouse;
+                
+                // 更新鼠标跟踪（每帧都需要更新以计算加速度）
+                m.prevVelocityX = m.velocityX;
+                m.prevVelocityY = m.velocityY;
+                
+                // 如果鼠标没有移动，速度归零
+                if (!this.isDragging) {
+                    m.velocityX *= 0.9;  // 逐渐减速
+                    m.velocityY *= 0.9;
+                    
+                    // 计算衰减的加速度
+                    const rawAccelX = m.velocityX - m.prevVelocityX;
+                    const rawAccelY = m.velocityY - m.prevVelocityY;
+                    m.accelerationX = m.accelerationX * m.accelerationSmoothing + rawAccelX * (1.0 - m.accelerationSmoothing);
+                    m.accelerationY = m.accelerationY * m.accelerationSmoothing + rawAccelY * (1.0 - m.accelerationSmoothing);
+                }
+                
+                // 保存上一帧位置
+                p.prevX = p.currentX;
+                p.prevY = p.currentY;
+                
+                // 如果在拖动，使用目标位置；否则保持当前目标
+                if (!this.isDragging && (p.targetX === 0 && p.targetY === 0)) {
+                    // 如果没有鼠标交互，默认居中
+                    p.targetX = 0.5;
+                    p.targetY = 0.5;
+                }
+                
+                // 计算弹簧力
+                const springForceX = (p.targetX - p.currentX) * p.springStrength;
+                const springForceY = (p.targetY - p.currentY) * p.springStrength;
+                
+                // 更新速度（弹簧力 + 阻尼）
+                p.velocityX = (p.velocityX + springForceX) * p.damping;
+                p.velocityY = (p.velocityY + springForceY) * p.damping;
+                
+                // 限制最大速度
+                const physicsVelocityMagnitude = Math.sqrt(p.velocityX * p.velocityX + p.velocityY * p.velocityY);
+                if (physicsVelocityMagnitude > p.maxVelocity) {
+                    p.velocityX = (p.velocityX / physicsVelocityMagnitude) * p.maxVelocity;
+                    p.velocityY = (p.velocityY / physicsVelocityMagnitude) * p.maxVelocity;
+                }
+                
+                // 更新位置
+                p.currentX += p.velocityX * deltaTime;
+                p.currentY += p.velocityY * deltaTime;
+                
+                // 基于鼠标加速度计算水滴形变
+                // 计算鼠标加速度的大小和方向
+                const accelMagnitude = Math.sqrt(m.accelerationX * m.accelerationX + m.accelerationY * m.accelerationY);
+                const velocityMagnitude = Math.sqrt(m.velocityX * m.velocityX + m.velocityY * m.velocityY);
+                
+                // 结合加速度和速度来确定形变强度（速度提供基础，加速度提供变化）
+                const combinedMagnitude = accelMagnitude * 30.0 + velocityMagnitude * 2.0;
+                
+                if (combinedMagnitude > 0.01 && this.isDragging) {
+                    // 计算主要运动方向（优先使用速度，加速度为辅）
+                    let dirX, dirY;
+                    if (velocityMagnitude > 0.001) {
+                        // 使用速度方向作为主要方向
+                        dirX = m.velocityX / velocityMagnitude;
+                        dirY = m.velocityY / velocityMagnitude;
+                    } else {
+                        // 速度很小时使用加速度方向
+                        dirX = m.accelerationX / accelMagnitude;
+                        dirY = m.accelerationY / accelMagnitude;
+                    }
+                    
+                    // 计算运动方向的角度（水滴尖端指向的方向）
+                    const angle = Math.atan2(dirY, dirX);
+                    
+                    // 计算形变强度
+                    const targetStrength = Math.min(combinedMagnitude, 1.0) * p.maxDeformation;
+                    
+                    // 平滑插值到目标强度和角度
+                    p.deformationStrength = p.deformationStrength * 0.85 + targetStrength * 0.15;
+                    
+                    // 角度的平滑插值（处理角度环绕）
+                    let angleDiff = angle - p.deformationAngle;
+                    // 确保角度差在 -π 到 π 之间
+                    while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+                    while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+                    
+                    p.deformationAngle += angleDiff * 0.2; // 角度变化更快一些
+                    
+                } else {
+                    // 没有运动时逐渐恢复圆形
+                    p.deformationStrength *= p.deformationDecay;
+                }
+                
+                // 确保参数在合理范围内
+                p.deformationStrength = Math.max(0.0, Math.min(1.0, p.deformationStrength));
+            }
+
+            updateDebugInfo() {
+                document.getElementById('mouseX').textContent = this.mouseX.toFixed(3);
+                document.getElementById('mouseY').textContent = this.mouseY.toFixed(3);
+                document.getElementById('physicsX').textContent = this.physics.currentX.toFixed(3);
+                document.getElementById('physicsY').textContent = this.physics.currentY.toFixed(3);
+                document.getElementById('mouseVelX').textContent = this.mouse.velocityX.toFixed(3);
+                document.getElementById('mouseVelY').textContent = this.mouse.velocityY.toFixed(3);
+                document.getElementById('mouseAccelX').textContent = this.mouse.accelerationX.toFixed(3);
+                document.getElementById('mouseAccelY').textContent = this.mouse.accelerationY.toFixed(3);
+                document.getElementById('velocityX').textContent = this.physics.velocityX.toFixed(3);
+                document.getElementById('velocityY').textContent = this.physics.velocityY.toFixed(3);
+                document.getElementById('deformStrength').textContent = this.physics.deformationStrength.toFixed(3);
+                document.getElementById('deformAngle').textContent = (this.physics.deformationAngle * 180 / Math.PI).toFixed(1);
+            }
+
+            render() {
+                const startTime = performance.now();
+                let lastTime = 0;
+                
+                const renderFrame = (currentTimeMs) => {
+                    const currentTime = (currentTimeMs - startTime) / 1000.0;
+                    const deltaTime = Math.min((currentTimeMs - lastTime) / 1000.0, 0.016); // 限制到60fps
+                    lastTime = currentTimeMs;
+                    
+                    // 更新物理仿真
+                    this.updatePhysics(deltaTime);
+                    
+                    // 更新调试信息
+                    // this.updateDebugInfo();
+                    
+                    // Update uniform data: mousePos (vec2), time (f32), resolution (vec2), deformation (vec2: strength, angle)
+                    const uniformData = new Float32Array([
+                        this.physics.currentX, this.physics.currentY,  // mousePos: vec2<f32> (使用物理位置)
+                        currentTime,                                   // time: f32
+                        0.0,                                          // padding for alignment
+                        this.canvas.width, this.canvas.height,       // resolution: vec2<f32>
+                        this.physics.deformationStrength, this.physics.deformationAngle,  // deformation: vec2<f32> (strength, angle)
+                    ]);
+                    
+                    this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
+
+                    const commandEncoder = this.device.createCommandEncoder();
+                    const textureView = this.context.getCurrentTexture().createView();
+                    
+                    const renderPassDescriptor = {
+                        colorAttachments: [{
+                            view: textureView,
+                            clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                            loadOp: 'clear',
+                            storeOp: 'store',
+                        }],
+                    };
+
+                    const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+                    passEncoder.setPipeline(this.renderPipeline);
+                    passEncoder.setBindGroup(0, this.bindGroup);
+                    passEncoder.draw(6, 1, 0, 0);
+                    passEncoder.end();
+
+                    this.device.queue.submit([commandEncoder.finish()]);
+                    requestAnimationFrame(renderFrame);
+                };
+                
+                requestAnimationFrame(renderFrame);
+            }
+        }
+
+        async function main() {
+            try {
+                const renderer = new WebGPUImageRenderer();
+                await renderer.init();
+                
+                document.getElementById('fileInput').addEventListener('change', (e) => {
+                    const file = e.target.files[0];
+                    if (file) {
+                        renderer.updateTexture(file);
+                    }
+                });
+                
+                console.log('WebGPU Image Renderer initialized successfully!');
+            } catch (error) {
+                console.error('Failed to initialize WebGPU:', error);
+                document.body.innerHTML = `
+                    <div style="text-align: center; margin-top: 100px;">
+                        <h2>WebGPU Not Supported</h2>
+                        <p>Your browser doesn't support WebGPU or it's not enabled.</p>
+                        <p>Please use Chrome/Edge with WebGPU enabled.</p>
+                    </div>
+                `;
+            }
+        }
+
+        window.addEventListener('load', main);
+    </script>
+    
+    <!-- README 展示区域 -->
+    <div style="position: fixed; bottom: 0; left: 0; right: 0; background: rgba(0, 0, 0, 0.8); color: white; padding: 15px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; line-height: 1.5; backdrop-filter: blur(10px);">
+        <div style="max-width: 1200px; margin: 0 auto;">
+            <h3 style="margin: 0 0 10px 0; font-size: 16px; font-weight: 600;">WebGPU Droplet Glass Demo</h3>
+            <p style="margin: 0 0 8px 0;">
+                This project was inspired by and adapted from the excellent shader work by 
+                <a href="https://www.shadertoy.com/view/tfyXRz" target="_blank" style="color: #60a5fa; text-decoration: none;">Inigo Quilez</a> 
+                on ShaderToy.
+            </p>
+            <p style="margin: 0;">
+                The demonstration image used in this project is sourced from the 
+                <a href="https://www.apple.com/" target="_blank" style="color: #60a5fa; text-decoration: none;">Apple Vision Pro</a> 
+                website.
+            </p>
+        </div>
+    </div>
+</body>
+</html> 
